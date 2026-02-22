@@ -7,7 +7,6 @@ import csv
 import time
 import requests
 import logging
-import resources_rc
 from datetime import datetime
 import platform
 
@@ -447,13 +446,21 @@ class ChangelogDialog(QDialog):
         layout = QVBoxLayout(self)
         
         browser = QTextBrowser()
-        from PyQt6.QtCore import QFile, QTextStream
-        file = QFile(":/changelog.md")
-        if file.open(QFile.OpenModeFlag.ReadOnly):
-            stream = QTextStream(file)
-            md_text = stream.readAll()
+        import os
+        import sys
+        if getattr(sys, 'frozen', False):
+            base_dir = sys._MEIPASS
+        else:
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            
+        c_path = os.path.join(base_dir, "changelog.md")
+        if os.path.exists(c_path):
+            with open(c_path, 'r', encoding='utf-8') as f:
+                md_text = f.read()
             browser.setMarkdown(md_text)
-            file.close()
+        else:
+            browser.setMarkdown("# Changelog\nCould not load changelog data natively. See GitHub.")
+            
         layout.addWidget(browser)
         
         btn = QPushButton("Close")
