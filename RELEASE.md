@@ -1,8 +1,14 @@
-# PostPocket Pro v1.0.0 - The Ultimate Release
+# PostPocket Pro v1.1.1 - Quality & Localization Polish
 
 Welcome to the definitive version of PostPocket Pro! We've evolved from a simple Python drafting script into a fully-fledged, secure, and professional social media command center.
 
-## ✨ New in v1.0.0
+## ✨ New in v1.1.1 (Phase 13 Patch)
+*   **Intelligent Localization**: The Schedule Date parameter now actively interrogates system layouts mapping explicit local parameters dynamically over ISO bounds! 
+*   **Error Recovery UX**: OAuth exceptions natively route standard warnings bypassing the command window towards intuitive visual mapping redirects pointing squarely at the `apiKey` setups!
+*   **Hashtag Copilots**: Injected automated string completers anticipating popular `#tech` hashtag inputs immediately accelerating routine text generations locally.
+*   **Free-Tier AI Previews**: Simulated `grok_ai_suggest` mock validations across 2 usages exclusively capping non-PRO users natively.
+
+## ✨ New in v1.1.0
 
 ### Monetization & Enterprise Security
 *   **AES-256 Database Encryption**: Your unpublished drafts and ideas are now intrinsically safe. Enable `Security` in settings to transparently encrypt all Post Content at-rest using 32-byte `cryptography.fernet` symmetric keys locked natively to your Windows User profile!

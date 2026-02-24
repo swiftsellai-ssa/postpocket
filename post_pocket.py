@@ -60,7 +60,7 @@ from PyQt6.QtWidgets import (
     QFileDialog, QSystemTrayIcon, QMenu, QLabel, QPushButton, QInputDialog,
     QColorDialog, QStyle, QTabWidget, QTableWidget, QTableWidgetItem,
     QHeaderView, QFormLayout, QDateTimeEdit, QComboBox, QMenuBar, QSplashScreen, QFontDialog,
-    QWizard, QWizardPage, QRadioButton, QButtonGroup, QCheckBox, QAbstractItemView
+    QWizard, QWizardPage, QRadioButton, QButtonGroup, QCheckBox, QAbstractItemView, QProgressBar
 )
 from PyQt6.QtGui import (
     QAction, QIcon, QPalette, QColor, QTextCharFormat, QFont,
@@ -270,6 +270,11 @@ class SettingsDialog(QDialog):
         self.crypto_checkbox.setChecked(is_crypto)
         form.addRow("Security:", self.crypto_checkbox)
         
+        self.watermark_checkbox = QCheckBox("Show Beta Watermark Overlay")
+        is_watermark = settings.value("show_watermark", True, type=bool)
+        self.watermark_checkbox.setChecked(is_watermark)
+        form.addRow("Watermark:", self.watermark_checkbox)
+        
         self.debug_checkbox = QCheckBox("Enable Debug Mode (Simulate API/Network errors)")
         is_debug = settings.value("debug_mode", False, type=bool)
         self.debug_checkbox.setChecked(is_debug)
@@ -314,6 +319,7 @@ class SettingsDialog(QDialog):
         settings.setValue("pro_license", self.license_input.text().strip())
         settings.setValue("db_crypto", self.crypto_checkbox.isChecked())
         settings.setValue("debug_mode", self.debug_checkbox.isChecked())
+        settings.setValue("show_watermark", self.watermark_checkbox.isChecked())
         
         # 2FA Implementation
         if self.two_fa_checkbox.isChecked() and not settings.value("two_fa_enabled", False, type=bool):
@@ -993,6 +999,8 @@ class XApiWorker(QObject):
 
     @pyqtSlot(str, object)
     def handle_request(self, action, data):
+        import time
+        import ntplib
         try:
             from PyQt6.QtCore import QSettings
             settings = QSettings("PostPocket", "PostPocketPro")
@@ -1000,44 +1008,77 @@ class XApiWorker(QObject):
                 raise Exception("DEBUG MODE: Simulated network/API failure.")
             
             client = self.get_client()
-            if action == 'post':
-                text = data['text']
-                post_id = data['post_id']
-                chunks = self.chunk_text(text)
-                previous_id, tweet_ids = None, []
-                
-                for chunk in chunks:
-                    resp = client.create_tweet(text=chunk, in_reply_to_tweet_id=previous_id) if previous_id else client.create_tweet(text=chunk)
-                    previous_id = resp.data['id']
-                    tweet_ids.append(previous_id)
-                    
-                self.finished.emit('post_success', {'post_id': post_id, 'tweet_ids': tweet_ids})
-                logging.info(f"Successfully posted {len(tweet_ids)} tweets for post_id: {post_id}")
-                
-            elif action == 'fetch_stats_bulk':
-                tweet_ids = data['tweet_ids']
-                metrics_map = {}
-                if not tweet_ids:
-                    self.finished.emit('stats_bulk_success', metrics_map)
-                    return
-                    
-                for i in range(0, len(tweet_ids), 100):
-                    chunk = tweet_ids[i:i+100]
-                    resp = client.get_tweets(ids=chunk, tweet_fields=['public_metrics'])
-                    if resp.data:
-                        for tw in resp.data:
-                            metrics_map[str(tw.id)] = tw.public_metrics
+            max_retries = 3
+            backoffs = [1, 2, 4]
+            
+            for attempt in range(max_retries + 1):
+                try:
+                    if action == 'post':
+                        text = data['text']
+                        post_id = data['post_id']
+                        chunks = self.chunk_text(text)
+                        previous_id, tweet_ids = None, []
+                        
+                        for chunk in chunks:
+                            resp = client.create_tweet(text=chunk, in_reply_to_tweet_id=previous_id) if previous_id else client.create_tweet(text=chunk)
+                            previous_id = resp.data['id']
+                            tweet_ids.append(previous_id)
                             
-                    self.finished.emit('stats_bulk_success', metrics_map)
-                logging.info(f"Successfully fetched stats for {len(metrics_map)} tweets.")
+                        self.finished.emit('post_success', {'post_id': post_id, 'tweet_ids': tweet_ids})
+                        logging.info(f"Successfully posted {len(tweet_ids)} tweets for post_id: {post_id}")
+                        return
+                        
+                    elif action == 'fetch_stats_bulk':
+                        tweet_ids = data['tweet_ids']
+                        metrics_map = {}
+                        if not tweet_ids:
+                            self.finished.emit('stats_bulk_success', metrics_map)
+                            return
+                            
+                        for i in range(0, len(tweet_ids), 100):
+                            chunk = tweet_ids[i:i+100]
+                            resp = client.get_tweets(ids=chunk, tweet_fields=['public_metrics'], user_auth=True)
+                            if resp.data:
+                                for tw in resp.data:
+                                    metrics_map[str(tw.id)] = tw.public_metrics
+                                    
+                            self.finished.emit('stats_bulk_success', metrics_map)
+                        logging.info(f"Successfully fetched stats for {len(metrics_map)} tweets.")
+                        return
+
+                except tweepy.errors.Unauthorized as e:
+                    if attempt < max_retries:
+                        sleep_time = backoffs[attempt]
+                        logging.warning(f"401 Unauthorized (Attempt {attempt+1}). Retrying in {sleep_time}s...", exc_info=True)
+                        time.sleep(sleep_time)
+                    else:
+                        # Check NTP sync on final failure
+                        try:
+                            ntp_c = ntplib.NTPClient()
+                            res = ntp_c.request('pool.ntp.org', version=3, timeout=2)
+                            offset = abs(res.offset)
+                            if offset > 5:
+                                logging.error(f"System clock out of sync by {offset:.2f}s. This breaks X OAuth 1.0a signatures.")
+                                self.error.emit(action, f"Time sync error: System clock is off by {offset:.0f}s. Please sync your Windows time.")
+                                return
+                        except Exception as ntp_e:
+                            logging.warning(f"Failed NTP time check: {ntp_e}")
+                        raise e # re-raise to outer exception handler
+
         except requests.exceptions.ConnectionError as e:
             logging.error(f"X API Connection Error: {e}", exc_info=True)
             self.error.emit(action, "Connection Error. Please check your internet connection.")
         except tweepy.errors.TooManyRequests as e:
             logging.error(f"X API Rate Limit Exceeded: {e}", exc_info=True)
             self.error.emit(action, "Rate limit exceeded. Please try again later.")
+        except tweepy.errors.Forbidden as e:
+            logging.error(f"X API Forbidden: {e}", exc_info=True)
+            self.error.emit(action, "403 Forbidden. Your X account may be on the Free Tier, which restricts fetching historical stats natively.")
+        except tweepy.errors.Unauthorized as e:
+            logging.exception(f"X API Unauthorized after retries during {action}:", exc_info=True)
+            self.error.emit(action, "401 Unauthorized. Your X API keys might be invalid or your system clock is out of sync.")
         except Exception as e:
-            logging.exception(f"X API Error during {action}:")
+            logging.exception(f"X API Error during {action}:", exc_info=True)
             self.error.emit(action, str(e))
 
 
@@ -1068,15 +1109,48 @@ class ApiKeyDialog(QDialog):
         layout.addRow("OpenAI Key:", self.openai_key)
         
         btn_layout = QHBoxLayout()
+        test_btn = QPushButton("Test Connection")
+        test_btn.clicked.connect(self.test_connection)
         save_btn = QPushButton("Save Config")
         save_btn.clicked.connect(self.save_keys)
         cancel_btn = QPushButton("Cancel")
         cancel_btn.clicked.connect(self.reject)
         
+        btn_layout.addWidget(test_btn)
         btn_layout.addWidget(save_btn)
         btn_layout.addWidget(cancel_btn)
         layout.addRow(btn_layout)
         
+    def test_connection(self):
+        import tweepy
+        from PyQt6.QtWidgets import QMessageBox, QApplication
+        from PyQt6.QtCore import Qt
+        
+        tmp_api_key = self.api_key.text().strip()
+        tmp_api_secret = self.api_secret.text().strip()
+        tmp_access_token = self.access_token.text().strip()
+        tmp_access_secret = self.access_secret.text().strip()
+        
+        if not all([tmp_api_key, tmp_api_secret, tmp_access_token, tmp_access_secret]):
+            QMessageBox.warning(self, "Error", "Please fill in all X API fields first.")
+            return
+            
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            client = tweepy.Client(
+                consumer_key=tmp_api_key, consumer_secret=tmp_api_secret,
+                access_token=tmp_access_token, access_token_secret=tmp_access_secret
+            )
+            me = client.get_me()
+            QApplication.restoreOverrideCursor()
+            if me and me.data:
+                QMessageBox.information(self, "Success", f"Connection successful!\nAuthenticated as: @{me.data.username}")
+            else:
+                QMessageBox.warning(self, "Failed", "Credentials verified, but could not fetch user data. Check permissions.")
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "Connection Failed", f"Failed to authenticate (401 Unauthorized likely):\n{e}")
+
     def save_keys(self):
         keyring.set_password("PostPocket", "api_key", self.api_key.text().strip())
         keyring.set_password("PostPocket", "api_secret", self.api_secret.text().strip())
@@ -1228,18 +1302,29 @@ class PostPocketQt(QMainWindow):
                     QMessageBox.warning(None, "Unlock Failed", "Invalid or missing 2FA code.\n\nPRO features will be temporarily disabled for this session.")
                     self.is_premium = False
 
+        # Check API validity on startup
+        import keyring
+        if not keyring.get_password("PostPocket", "api_key"):
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "API Missing", "Set up X API keys to enable posting and stats.")
+            self.config_keys()
+
         # Beta Watermark Overlay
-        from PyQt6.QtCore import Qt
-        self.watermark_lbl = QLabel("BETA VERSION", self)
+        from PyQt6.QtCore import QSettings
+        settings = QSettings("PostPocket", "PostPocketPro")
+        
+        self.watermark_lbl = QLabel("BETA VERSION 1.1.1", self)
         self.watermark_lbl.setStyleSheet("""
-            color: rgba(255, 0, 0, 80);
-            font-size: 40px;
+            color: rgba(136, 153, 166, 128);
+            font-size: 24px;
             font-weight: bold;
             background: transparent;
         """)
         self.watermark_lbl.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.watermark_lbl.adjustSize()
-        if self.is_premium:
+        
+        show_watermark = settings.value("show_watermark", True, type=bool)
+        if self.is_premium or not show_watermark:
             self.watermark_lbl.hide()
 
 
@@ -1363,6 +1448,7 @@ class PostPocketQt(QMainWindow):
         
         self.cat_tree = QTreeWidget()
         self.cat_tree.setHeaderHidden(True)
+        self.cat_tree.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.cat_tree.itemClicked.connect(self.on_category_select)
         self.cat_tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.cat_tree.customContextMenuRequested.connect(self.show_category_context_menu)
@@ -1421,6 +1507,9 @@ class PostPocketQt(QMainWindow):
         post_x_action.triggered.connect(self.action_post_to_x)
         self.schedule_datetime = QDateTimeEdit()
         self.schedule_datetime.setDateTime(QDateTime.currentDateTime())
+        from PyQt6.QtCore import QLocale
+        self.schedule_datetime.setLocale(QLocale.system())
+        self.schedule_datetime.setDisplayFormat(QLocale.system().dateTimeFormat(QLocale.FormatType.ShortFormat))
         self.schedule_datetime.setCalendarPopup(True)
         self.toolbar_x.addWidget(QLabel("Schedule: "))
         self.toolbar_x.addWidget(self.schedule_datetime)
@@ -1438,12 +1527,31 @@ class PostPocketQt(QMainWindow):
         self.tags_entry = QLineEdit()
         self.tags_entry.setPlaceholderText("Comma separated (e.g. startup, dev, tech)")
         self.tags_entry.textChanged.connect(self.content_changed)
+        
+        from PyQt6.QtWidgets import QCompleter
+        mock_tags = ["startup", "dev", "tech", "viral", "postpocket", "coding", "design", "marketing"]
+        self.completer = QCompleter(mock_tags, self)
+        self.completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.tags_entry.setCompleter(self.completer)
+        
         tags_layout.addWidget(self.tags_entry)
         self.editor_layout.addLayout(tags_layout)
         
+        self.editor_splitter = QSplitter(Qt.Orientation.Horizontal)
+        
         self.content_edit = QTextEdit()
+        self.content_edit.setPlaceholderText("Start typing your X post here... Supports bold, italics, links, emojis, and auto-thread splitting!")
         self.content_edit.textChanged.connect(self.content_changed)
-        self.editor_layout.addWidget(self.content_edit)
+        
+        self.preview_browser = QTextBrowser()
+        self.preview_browser.setOpenExternalLinks(True)
+        self.preview_browser.setStyleSheet("background-color: #15202b; color: #ffffff; padding: 10px; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; font-size: 14px; border-radius: 4px;")
+        
+        self.editor_splitter.addWidget(self.content_edit)
+        self.editor_splitter.addWidget(self.preview_browser)
+        self.editor_splitter.setSizes([600, 400])
+        
+        self.editor_layout.addWidget(self.editor_splitter)
         
         self.highlighter = TwitterHighlighter(self.content_edit.document())
         
@@ -1457,20 +1565,32 @@ class PostPocketQt(QMainWindow):
         self.analytics_layout = QVBoxLayout(self.analytics_tab)
         
         analytics_controls = QHBoxLayout()
-        fetch_stats_action = QPushButton("Fetch Updates via X API")
-        fetch_stats_action.setToolTip("Pulls real-time analytics for your published posts directly from X")
-        fetch_stats_action.setAccessibleName("Fetch X Analytics Button")
-        fetch_stats_action.clicked.connect(self.refresh_analytics)
+        self.fetch_stats_action = QPushButton("Fetch Updates via X API")
+        self.fetch_stats_action.setToolTip("Pulls real-time analytics for your published posts directly from X")
+        self.fetch_stats_action.setAccessibleName("Fetch X Analytics Button")
+        self.fetch_stats_action.clicked.connect(self.refresh_analytics)
         
         export_png_action = QPushButton("Export Chart (PNG)")
         export_png_action.setToolTip("Export the engagement history chart as a PNG image")
         export_png_action.setAccessibleName("Export Chart Button")
         export_png_action.clicked.connect(self.export_chart_png)
         
-        analytics_controls.addWidget(fetch_stats_action)
+        analytics_controls.addWidget(self.fetch_stats_action)
         analytics_controls.addWidget(export_png_action)
         analytics_controls.addStretch()
         self.analytics_layout.addLayout(analytics_controls)
+        
+        self.analytics_progress = QProgressBar()
+        self.analytics_progress.setTextVisible(False)
+        self.analytics_progress.setFixedHeight(4)
+        self.analytics_progress.hide()
+        self.analytics_layout.addWidget(self.analytics_progress)
+        
+        self.analytics_empty_label = QLabel("No published posts yet—create, post, and fetch stats to analyze engagement!")
+        self.analytics_empty_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.analytics_empty_label.setStyleSheet("color: #8899a6; font-size: 16px; margin: 50px;")
+        self.analytics_empty_label.hide()
+        self.analytics_layout.addWidget(self.analytics_empty_label)
         
         self.kpi_layout = QHBoxLayout()
         self.kpi_likes = QLabel("<b>Likes</b><br><span style='font-size: 24px; color: #f91880;'>0</span>")
@@ -1619,12 +1739,32 @@ class PostPocketQt(QMainWindow):
             QMessageBox.critical(self, "Export Failed", f"Export encoding generated errors:\n{e}")
 
     def on_error(self, action, err_msg):
+        if action == "fetch_stats_bulk":
+            self.analytics_progress.hide()
+            self.fetch_stats_action.setEnabled(True)
+            
+        is_auth_error = False
         if "401 Unauthorized" in err_msg:
             err_msg = "X API Authentication Failed (401). Please check your API keys via File -> API Configurations."
+            is_auth_error = True
         elif "insufficient_quota" in err_msg or "429" in err_msg:
             err_msg = "OpenAI API Quota Exceeded (429). Please check your billing details and account credits."
             
-        QMessageBox.warning(self, "Error", f"Action '{action}' failed:\n{err_msg}")
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Warning)
+        msg.setWindowTitle("Error")
+        msg.setText(f"Action '{action}' failed:\n{err_msg}")
+        
+        if is_auth_error:
+            config_btn = msg.addButton("Go to API Configurations", QMessageBox.ButtonRole.ActionRole)
+            msg.addButton(QMessageBox.StandardButton.Ok)
+            msg.exec()
+            if msg.clickedButton() == config_btn:
+                self.config_keys()
+        else:
+            msg.setStandardButtons(QMessageBox.StandardButton.Ok)
+            msg.show()
+
         self.statusBar().showMessage("Error occurred.")
         if action == "post":
             self.request_db.emit("update_post_status", {"post_id": self.current_post_id, "status": "error"})
@@ -1648,6 +1788,10 @@ class PostPocketQt(QMainWindow):
             self.tag_filter_combo.blockSignals(False)
             
         elif action == "posts_loaded":
+            import time
+            import logging
+            dur = time.time() - self.load_start_time if hasattr(self, 'load_start_time') else 0.0
+            
             append = result['append']
             posts = result['posts']
             limit = result['limit']
@@ -1657,7 +1801,9 @@ class PostPocketQt(QMainWindow):
                 for post in posts: self.add_post_ui_item(post)
                 self.has_more_posts = len(posts) == limit
                 self.is_loading_posts = False
-            self.statusBar().showMessage("Posts loaded.")
+            
+            self.statusBar().showMessage(f"Loaded {len(posts)} posts in {dur:.2f}s")
+            logging.info(f"Loaded {len(posts)} posts in {dur:.3f}s")
             
         elif action == "post_full_loaded":
             if result:
@@ -1742,13 +1888,40 @@ class PostPocketQt(QMainWindow):
         ApiKeyDialog(self).exec()
 
     def grok_ai_suggest(self):
+        from PyQt6.QtCore import QSettings, QDate
+        import random
+        settings = QSettings("PostPocket", "PostPocketPro")
+        
         if not self.is_premium:
-            QMessageBox.warning(self, "Premium Feature", "🚀 Grok AI Hashtag Generation is a PRO feature!\n\nUpgrade your license in Settings to unlock advanced AI capabilities and unlimited post drafting.")
-            return
+            today = QDate.currentDate().toString()
+            last_used = settings.value("grok_last_used", "")
+            count = settings.value("grok_daily_count", 0, type=int)
             
+            if last_used != today:
+                count = 0
+                settings.setValue("grok_last_used", today)
+                
+            if count >= 2:
+                QMessageBox.warning(self, "Premium Feature", "🚀 You've reached your free daily limit for Grok AI Suggestions (2/day)!\n\nUpgrade your license in Settings to unlock unlimited AI.")
+                return
+                
+            count += 1
+            settings.setValue("grok_daily_count", count)
+            QMessageBox.information(self, "Grok AI (Free Tier)", f"Generating viral hashtags... ({2 - count} daily uses remaining)")
+            
+            mocks = ["#viral", "#trending", "#postpocket", "#tech", "#innovation", "#startup", "#growth"]
+            suggested = ", ".join(random.sample(mocks, 3))
+            
+            current = self.tags_entry.text().strip()
+            if current:
+                self.tags_entry.setText(current + ", " + suggested)
+            else:
+                self.tags_entry.setText(suggested)
+            return
+
         # Mock the premium execution
         QMessageBox.information(self, "Grok AI", "Generating viral hashtags with Grok... (Premium Feature Mock)")
-        current = self.tags_entry.text()
+        current = self.tags_entry.text().strip()
         if current:
             self.tags_entry.setText(current + ", #viral, #grok, #pro")
         else:
@@ -1793,6 +1966,21 @@ class PostPocketQt(QMainWindow):
         if index == 1: self.refresh_analytics()
 
     def refresh_analytics(self):
+        import keyring
+        from PyQt6.QtWidgets import QMessageBox
+        api_key = keyring.get_password("PostPocket", "api_key")
+        if not api_key:
+            QMessageBox.warning(self, "API Missing", "Set up X API keys to enable posting and stats.")
+            if hasattr(self, 'fetch_stats_action'):
+                self.fetch_stats_action.setEnabled(False)
+            self.config_keys()
+            return
+            
+        if hasattr(self, 'fetch_stats_action'):
+            self.fetch_stats_action.setEnabled(False)
+        self.analytics_progress.setRange(0, 0)
+        self.analytics_progress.show()
+        
         self.statusBar().showMessage("Loading local post history...")
         self.request_db.emit("load_analytics_data", None)
 
@@ -1810,8 +1998,30 @@ class PostPocketQt(QMainWindow):
 
     def render_analytics(self, metrics_map):
         with QMutexLocker(self.data_mutex):
+            self.analytics_progress.hide()
+            if hasattr(self, 'fetch_stats_action'):
+                self.fetch_stats_action.setEnabled(True)
+                
             self.stats_table.setRowCount(0)
             self.plot_widget.clear()
+            
+            from PyQt6.QtCore import QSettings
+            import random
+            settings = QSettings("PostPocket", "PostPocketPro")
+            is_debug = settings.value("debug_mode", False, type=bool)
+            
+            if not self.analytics_posts_cache:
+                self.stats_table.hide()
+                self.plot_widget.hide()
+                self.analytics_empty_label.show()
+                self.kpi_likes.setText("<b>Likes</b><br><span style='font-size: 24px; color: #f91880;'>0</span>")
+                self.kpi_retweets.setText("<b>Retweets</b><br><span style='font-size: 24px; color: #00ba7c;'>0</span>")
+                self.kpi_replies.setText("<b>Replies</b><br><span style='font-size: 24px; color: #1d9bf0;'>0</span>")
+                return
+            else:
+                self.stats_table.show()
+                self.plot_widget.show()
+                self.analytics_empty_label.hide()
             
             y_data, x_ticks = [], []
             idx = 0
@@ -1820,6 +2030,14 @@ class PostPocketQt(QMainWindow):
                 meta = json.loads(p.get('metadata', '{}'))
                 tw_id = str(meta.get('tweet_ids', [''])[0]) if meta.get('tweet_ids') else None
                 metric = metrics_map.get(tw_id, {'like_count': 0, 'retweet_count': 0, 'reply_count': 0, 'impression_count': 0})
+                
+                if is_debug and not tw_id:
+                    metric = {
+                        'like_count': random.randint(10, 500),
+                        'retweet_count': random.randint(1, 50),
+                        'reply_count': random.randint(0, 20),
+                        'impression_count': random.randint(1000, 5000)
+                    }
                 
                 total_likes += metric.get('like_count', 0)
                 total_rts += metric.get('retweet_count', 0)
@@ -1838,8 +2056,8 @@ class PostPocketQt(QMainWindow):
                 idx += 1
                 
             self.kpi_likes.setText(f"<b>Likes</b><br><span style='font-size: 24px; color: #f91880;'>{total_likes}</span>")
-        self.kpi_retweets.setText(f"<b>Retweets</b><br><span style='font-size: 24px; color: #00ba7c;'>{total_rts}</span>")
-        self.kpi_replies.setText(f"<b>Replies</b><br><span style='font-size: 24px; color: #1d9bf0;'>{total_replies}</span>")
+            self.kpi_retweets.setText(f"<b>Retweets</b><br><span style='font-size: 24px; color: #00ba7c;'>{total_rts}</span>")
+            self.kpi_replies.setText(f"<b>Replies</b><br><span style='font-size: 24px; color: #1d9bf0;'>{total_replies}</span>")
             
         if y_data:
             pen = pg.mkPen(color=(29, 155, 240), width=3)
@@ -1847,6 +2065,9 @@ class PostPocketQt(QMainWindow):
             self.plot_widget.getAxis('bottom').setTicks([x_ticks])
 
     def load_posts(self, append=False):
+        import time
+        self.load_start_time = time.time()
+        
         if not append: self.current_offset = 0
         self.is_loading_posts = True
         self.request_db.emit("load_posts", {
@@ -1876,7 +2097,9 @@ class PostPocketQt(QMainWindow):
         
         nodes = {}
         for cat in self.category_data:
-            item = QTreeWidgetItem([f"{cat['name']} ({self.cat_counts.get(cat['name'], 0)})"])
+            cat_text = f"{cat['name']} ({self.cat_counts.get(cat['name'], 0)})"
+            item = QTreeWidgetItem([cat_text])
+            item.setToolTip(0, cat['name'])
             item.setData(0, Qt.ItemDataRole.UserRole, cat['name'])
             nodes[cat['id']] = {'item': item, 'parent_id': cat['parent_id']}
             
@@ -2131,7 +2354,7 @@ class PostPocketQt(QMainWindow):
     def update_watermark_position(self):
         if hasattr(self, 'watermark_lbl'):
             x = self.width() - self.watermark_lbl.width() - 20
-            y = self.height() - self.watermark_lbl.height() - 20
+            y = self.height() - self.watermark_lbl.height() - 70
             self.watermark_lbl.move(x, y)
 
     def open_changelog(self):
@@ -2193,6 +2416,14 @@ class PostPocketQt(QMainWindow):
             
         self.char_label.setText(status_text)
         self.unsaved_changes = True
+        
+        # Markdown preview renderer
+        import markdown
+        try:
+            html = markdown.markdown(text, extensions=['fenced_code', 'nl2br'])
+            self.preview_browser.setHtml(f"<html><head><style>body{{color: #ffffff; font-family: sans-serif; font-size: 14px;}}</style></head><body>{html}</body></html>")
+        except Exception as e:
+            pass
 
     def toggle_format(self, tag_name):
         cursor = self.content_edit.textCursor()
@@ -2318,9 +2549,13 @@ class PostPocketQt(QMainWindow):
     def edit_category(self):
         if self.current_category:
             text, ok = QInputDialog.getText(self, "Edit Category", "New name:", text=self.current_category)
-            if ok and text and text not in self.categories:
-                self.request_db.emit("edit_category", {'old': self.current_category, 'new': text})
-                self.current_category = text
+            if ok and text:
+                if len(text) > 50:
+                    QMessageBox.warning(self, "Invalid Name", "Category name cannot exceed 50 characters.")
+                    return
+                if text not in self.categories:
+                    self.request_db.emit("edit_category", {'old': self.current_category, 'new': text})
+                    self.current_category = text
 
     def delete_category(self):
         if self.current_category == "General": return
